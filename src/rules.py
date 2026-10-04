@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import datetime
 from .domain import ConflictError, ValidationError
 TITLE='空气污染源许可与合规检查'; ENTITY='排污许可'; ID_PREFIX='AQ'
 SEVERITIES=['low', 'medium', 'high', 'critical']; STATES=['draft', 'submitted', 'inspection', 'correction', 'approved']; TRANSITIONS={'draft': ['submitted'], 'submitted': ['inspection'], 'inspection': ['correction'], 'correction': ['approved'], 'approved': []}; TRANSITION_ROLES={'submitted': ['applicant'], 'inspection': ['inspector'], 'correction': ['inspector'], 'approved': ['compliance_manager']}
@@ -20,3 +21,19 @@ def validate_transition(current,target):
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
 def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))
+# 日容量队列：把许可、整改事项与检查批次接成按日排期的容量队列
+DEFAULT_DAILY_CAPACITY=5
+DISPATCH_ROLES=set(['compliance_manager', 'inspector'])
+CLAIM_ROLES=set(['inspector'])
+CAPACITY_ROLES=set(['compliance_manager'])
+BATCH_STATES=['pending', 'dispatched', 'executed', 'cancelled']
+BATCH_ITEM_STATES=['queued', 'dispatched', 'claimed', 'executed']
+def load_factor(assigned,capacity):
+    if capacity<=0: return float('inf')
+    return assigned/capacity
+def remaining_capacity(capacity,assigned): return max(0,capacity-assigned)
+def validate_day(value):
+    if not isinstance(value,str): raise ValidationError("日期必须是YYYY-MM-DD")
+    try: datetime.strptime(value,'%Y-%m-%d')
+    except ValueError: raise ValidationError("日期格式应为YYYY-MM-DD")
+    return value

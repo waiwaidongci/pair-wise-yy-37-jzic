@@ -71,7 +71,15 @@ def make_handler(service: Service, static_dir: str):
                 status = 400
             else:
                 status = 500
-            self._json(status, {"error": exc.__class__.__name__, "message": str(exc)})
+            body = {"error": exc.__class__.__name__, "message": str(exc)}
+            detail = getattr(exc, "detail", None)
+            if detail:
+                body.update(detail)
+            self._json(status, body)
+
+        def _query(self, name: str) -> Optional[str]:
+            values = parse_qs(urlparse(self.path).query).get(name)
+            return values[0] if values else None
 
         def do_GET(self) -> None:
             try:
@@ -98,6 +106,14 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/queue":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.queue(self._query("day") or "", role))
+                elif path == "/api/queue/capacity":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"capacities": service.list_capacities(self._query("day") or "", role)})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +135,22 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path.startswith("/api/items/") and "/records/" in path and path.endswith("/status"):
+                    parts = path.split("/")
+                    item_id = int(parts[3])
+                    record_id = int(parts[5])
+                    self._json(200, service.update_record_status(
+                        item_id, record_id, body, actor, role))
+                elif path == "/api/queue/dispatch":
+                    self._json(200, service.dispatch(body.get("day"), actor, role))
+                elif path == "/api/queue/capacity":
+                    self._json(200, service.set_capacity(body, actor, role))
+                elif path.startswith("/api/queue/items/") and path.endswith("/claim"):
+                    batch_item_id = int(path.split("/")[4])
+                    self._json(200, service.claim(batch_item_id, actor, role))
+                elif path.startswith("/api/queue/items/") and path.endswith("/execute"):
+                    batch_item_id = int(path.split("/")[4])
+                    self._json(200, service.execute(batch_item_id, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:

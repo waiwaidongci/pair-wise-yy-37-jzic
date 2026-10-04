@@ -65,6 +65,43 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS inspector_days (
+                    inspector TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    capacity INTEGER NOT NULL DEFAULT 5,
+                    assigned INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (inspector, day)
+                );
+                CREATE TABLE IF NOT EXISTS batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    day TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK(status IN ('pending','dispatched','executed','cancelled')),
+                    basis TEXT NOT NULL DEFAULT '{{}}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS batch_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    day TEXT NOT NULL,
+                    inspector TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued'
+                        CHECK(status IN ('queued','dispatched','claimed','executed')),
+                    priority REAL NOT NULL DEFAULT 0,
+                    claimed_by TEXT,
+                    claimed_at TEXT,
+                    executed_at TEXT,
+                    basis TEXT NOT NULL DEFAULT '{{}}',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, batch_id)
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_batch_items_active
+                    ON batch_items(item_id)
+                    WHERE status IN ('queued','dispatched','claimed');
+                CREATE INDEX IF NOT EXISTS ix_batch_items_day_status
+                    ON batch_items(day, status);
             """)
 
     @staticmethod
@@ -213,3 +250,218 @@ class Repository:
     def close(self) -> None:
         with self._lock:
             self.conn.close()
+
+    # ---------- 检查员当天名额 ----------
+    def get_inspector_day(self, inspector: str, day: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM inspector_days WHERE inspector=? AND day=?",
+                (inspector, day),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_inspector_days(self, day: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM inspector_days WHERE day=? ORDER BY inspector", (day,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def set_capacity(self, inspector: str, day: str, capacity: int) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            self.conn.execute(
+                """INSERT INTO inspector_days(inspector, day, capacity, assigned)
+                   VALUES(?,?,?,0)
+                   ON CONFLICT(inspector, day) DO UPDATE SET capacity=excluded.capacity""",
+                (inspector, day, int(capacity)),
+            )
+        row = self.get_inspector_day(inspector, day)
+        assert row is not None
+        return row
+
+    def increment_assigned(self, inspector: str, day: str) -> bool:
+        """原子占用一个名额；仅当当前负荷未超容量时成功。"""
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE inspector_days SET assigned=assigned+1 WHERE inspector=? AND day=? AND assigned<capacity",
+                (inspector, day),
+            )
+            return cur.rowcount == 1
+
+    def decrement_assigned(self, inspector: str, day: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE inspector_days SET assigned=MAX(0,assigned-1) WHERE inspector=? AND day=?",
+                (inspector, day),
+            )
+
+    # ---------- 检查批次 ----------
+    def get_or_create_batch(self, day: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """INSERT OR IGNORE INTO batches(day, status, basis, created_at, updated_at)
+                   VALUES(?,?,?,?,?)""",
+                (day, "pending", "{}", now, now),
+            )
+            row = self.conn.execute("SELECT * FROM batches WHERE day=?", (day,)).fetchone()
+        return dict(row)
+
+    def get_batch_by_day(self, day: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM batches WHERE day=?", (day,)).fetchone()
+        return dict(row) if row else None
+
+    def update_batch_status(self, day: str, status: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE batches SET status=?, updated_at=? WHERE day=?",
+                (status, utc_now(), day),
+            )
+
+    # ---------- 批次明细（队列条目） ----------
+    def get_batch_item(self, batch_item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT bi.*, i.title, i.severity, i.quantity, i.threshold, i.status AS item_status
+                   FROM batch_items bi JOIN items i ON i.id=bi.item_id
+                   WHERE bi.id=?""",
+                (batch_item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_active_batch_item(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM batch_items
+                   WHERE item_id=? AND status IN ('queued','dispatched','claimed')
+                   ORDER BY id DESC LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_active_batch_items_for_item(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM batch_items WHERE item_id=? AND status IN ('queued','dispatched','claimed')",
+                (item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_queued_batch_items(self, day: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM batch_items WHERE day=? AND status='queued' ORDER BY priority DESC, id",
+                (day,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_batch_items(self, day: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                """SELECT bi.*, i.title, i.severity, i.quantity, i.threshold, i.status AS item_status
+                   FROM batch_items bi JOIN items i ON i.id=bi.item_id
+                   WHERE bi.day=? ORDER BY
+                     CASE bi.status WHEN 'executed' THEN 3 WHEN 'claimed' THEN 2 WHEN 'dispatched' THEN 1 ELSE 0 END,
+                     bi.priority DESC, bi.id""",
+                (day,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_queued_item(self, batch_id: int, item_id: int, day: str,
+                            priority: float) -> Dict[str, Any]:
+        """待派条目不存在则建立，已存在（待派）则刷新优先级；幂等，可安全重试。"""
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM batch_items WHERE batch_id=? AND item_id=?",
+                (batch_id, item_id),
+            ).fetchone()
+            if row is None:
+                cur = self.conn.execute(
+                    """INSERT INTO batch_items(batch_id, item_id, day, inspector, status,
+                       priority, basis, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                    (batch_id, item_id, day, None, "queued", priority, "{}", utc_now()),
+                )
+                bi_id = int(cur.lastrowid)
+            else:
+                bi_id = int(row["id"])
+                self.conn.execute(
+                    "UPDATE batch_items SET priority=? WHERE id=? AND status='queued'",
+                    (priority, bi_id),
+                )
+        result = self.get_batch_item(bi_id)
+        assert result is not None
+        return result
+
+    def assign_item(self, batch_item_id: int, inspector: str) -> bool:
+        """待派 -> 已派发（占用名额）。"""
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE batch_items SET status='dispatched', inspector=? WHERE id=? AND status='queued'",
+                (inspector, batch_item_id),
+            )
+            return cur.rowcount == 1
+
+    def claim_item(self, batch_item_id: int, actor: str) -> bool:
+        """已派发 -> 已认领；先到者占用，原子条件更新。"""
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE batch_items SET status='claimed', claimed_by=?, claimed_at=? WHERE id=? AND status='dispatched'",
+                (actor, utc_now(), batch_item_id),
+            )
+            return cur.rowcount == 1
+
+    def revert_to_queued(self, batch_item_id: int, priority: float) -> None:
+        """未执行条目退回待派：释放已占用名额，清空认领人，重算优先级。"""
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM batch_items WHERE id=?", (batch_item_id,)
+            ).fetchone()
+            if row is None:
+                return
+            if row["inspector"]:
+                self.conn.execute(
+                    "UPDATE inspector_days SET assigned=MAX(0,assigned-1) WHERE inspector=? AND day=?",
+                    (row["inspector"], row["day"]),
+                )
+            self.conn.execute(
+                """UPDATE batch_items SET status='queued', inspector=NULL, claimed_by=NULL,
+                   claimed_at=NULL, priority=? WHERE id=?""",
+                (priority, batch_item_id),
+            )
+
+    def execute_item(self, batch_item_id: int, basis: Dict[str, Any]) -> bool:
+        """已认领 -> 已执行；保留原依据快照。"""
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE batch_items SET status='executed', executed_at=?, basis=? WHERE id=? AND status='claimed'",
+                (utc_now(), json.dumps(basis, ensure_ascii=False, sort_keys=True), batch_item_id),
+            )
+            return cur.rowcount == 1
+
+    def count_dispatched(self, day: str) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM batch_items WHERE day=? AND status='dispatched'",
+                (day,),
+            ).fetchone()
+        return int(row["n"])
+
+    def all_items_executed(self, batch_id: int) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM batch_items WHERE batch_id=? AND status!='executed'",
+                (batch_id,),
+            ).fetchone()
+        return int(row["n"]) == 0
+
+    def update_record_status(self, item_id: int, record_id: int, status: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE records SET status=? WHERE id=? AND item_id=?",
+                (status, record_id, item_id),
+            )
+            if cur.rowcount == 0:
+                return None
+            row = self.conn.execute("SELECT * FROM records WHERE id=?", (record_id,)).fetchone()
+        return dict(row) if row else None
