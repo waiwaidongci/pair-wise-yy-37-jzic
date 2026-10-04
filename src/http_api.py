@@ -98,6 +98,21 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/inspectors":
+                    actor, role = self._identity()
+                    self._json(200, {"inspectors": service.list_inspectors(role)})
+                elif path.startswith("/api/schedule/"):
+                    day = path.rsplit("/", 1)[-1]
+                    actor, role = self._identity()
+                    self._json(200, service.day_schedule(day, role))
+                elif path == "/api/schedule":
+                    actor, role = self._identity()
+                    self._json(200, service.day_schedule(None, role))
+                elif path.startswith("/api/batches/"):
+                    parts = path.strip("/").split("/")
+                    batch_id = int(parts[2])
+                    actor, role = self._identity()
+                    self._json(200, service.get_batch(batch_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -110,15 +125,44 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
-                elif path.startswith("/api/items/") and path.endswith("/records"):
+                elif path == "/api/inspectors":
+                    self._json(201, service.create_inspector(body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/records") and path.count("/") == 4:
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif "/records/" in path and path.endswith("/close"):
+                    parts = path.strip("/").split("/")
+                    record_id = int(parts[2] if parts[1] == "records" else parts[3])
+                    self._json(200, service.close_record(record_id, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path.startswith("/api/schedule/") and path.endswith("/build"):
+                    day = path.split("/")[3]
+                    self._json(200, service.build_day_queue(day, actor, role))
+                elif path == "/api/schedule/build":
+                    self._json(200, service.build_day_queue(None, actor, role))
+                elif path == "/api/schedule/dispatch-next":
+                    self._json(200, service.dispatch_next(None, actor, role))
+                elif path.startswith("/api/schedule/") and path.endswith("/dispatch-next"):
+                    day = path.split("/")[3]
+                    self._json(200, service.dispatch_next(day, actor, role))
+                elif path.startswith("/api/batches/") and path.endswith("/claim-next"):
+                    day = body.get("day")
+                    inspector_id = body.get("inspector_id")
+                    self._json(200, service.claim_next(
+                        day, inspector_id, actor, role))
+                elif path.startswith("/api/batches/") and path.endswith("/claim"):
+                    batch_id = int(path.split("/")[3])
+                    self._json(200, service.claim_batch(
+                        batch_id, body.get("inspector_id"), actor, role))
+                elif path.startswith("/api/batches/") and path.endswith("/execute"):
+                    batch_id = int(path.split("/")[3])
+                    self._json(200, service.execute_batch(
+                        batch_id, body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
